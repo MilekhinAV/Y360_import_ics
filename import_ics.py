@@ -39,6 +39,13 @@ class RateLimited(Failure):
         self.retry_after = retry_after
 
 
+class TemporaryServerError(Failure):
+    def __init__(self, method, status, retry_after=None):
+        super().__init__(f"{method}:http_{status}")
+        self.status = status
+        self.retry_after = retry_after
+
+
 class RequestPacer:
     def __init__(self, interval=2.0):
         self.interval = interval
@@ -115,6 +122,13 @@ def transport(method, url, *, token=None, data=None, headers=None):
             if method not in {"GET", "PROPFIND", "REPORT", "POST"} or attempt == MAX_RATE_RETRIES:
                 raise
             wait_rate_limit(exc, attempt)
+        except TemporaryServerError as exc:
+            if method not in {"GET", "REPORT", "PROPFIND"} or attempt == MAX_RATE_RETRIES:
+                raise
+            delay = max(5 * 2 ** attempt, exc.retry_after or 0)
+            print(f"{method}: HTTP {exc.status}, ожидание {delay:.1f} с, "
+                  f"повтор {attempt + 1}/{MAX_RATE_RETRIES}", flush=True)
+            time.sleep(delay)
 
 
 def transport_once(method, url, *, token=None, data=None, headers=None):
@@ -147,6 +161,8 @@ def transport_once(method, url, *, token=None, data=None, headers=None):
             error.close()
         if error.code == 429:
             raise RateLimited(method, retry_after) from None
+        if error.code in {502, 503, 504}:
+            raise TemporaryServerError(method, error.code, retry_after) from None
         raise Failure(f"{method}:http_{error.code}{detail}") from None
     except (URLError, OSError):
         raise Failure(f"{method}:network_error") from None
@@ -306,7 +322,7 @@ class CalDAV:
         return uids
 
 
-def prepare(folder):
+def prepare(folder, sources=None):
     """Собирает серию и исключения из всех файлов до первой записи в API."""
     if not folder.is_dir():
         raise Failure("folder_not_found")
@@ -332,6 +348,8 @@ def prepare(folder):
             for original in source.walk("VEVENT"):
                 event = copy.deepcopy(original)
                 uid = str(event["UID"])
+                if sources is not None:
+                    sources.setdefault(uid, set()).add(path.name)
                 if not uid or "DTSTART" not in event or "DTSTAMP" not in event:
                     raise ValueError()
                 # Копии для просмотра; не отправляем приглашения и email-напоминания.
@@ -404,12 +422,48 @@ def create_and_read(client, calendar_url, resource, uid, payload):
         return read_created_event(client, calendar_url, resource, uid)
 
 
-def import_events(client, calendar_url, events, report):
+REPORT_FIELDS = ["uid_sha256", "status", "error", "uid", "summary", "start", "end",
+                 "start_timezone", "end_timezone", "all_day", "duration", "rrule",
+                 "exception_count", "source_files"]
+
+
+def report_details(uid, payload, sources=None):
+    events = Calendar.from_ical(payload).walk("VEVENT")
+    master = next(e for e in events if "RECURRENCE-ID" not in e)
+    def date_field(key):
+        prop = master.get(key)
+        if prop is None:
+            return "", ""
+        value = prop.dt
+        zone = str(prop.params.get("TZID") or getattr(value, "tzinfo", None) or
+                   ("floating" if hasattr(value, "hour") else "date"))
+        return value.isoformat(), zone
+    start, start_zone = date_field("DTSTART")
+    end, end_zone = date_field("DTEND")
+    return {
+        "uid": uid, "summary": str(master.get("SUMMARY", "")),
+        "start": start, "end": end, "start_timezone": start_zone, "end_timezone": end_zone,
+        "all_day": not hasattr(master["DTSTART"].dt, "hour"),
+        "duration": master["DURATION"].to_ical().decode() if "DURATION" in master else "",
+        "rrule": master["RRULE"].to_ical().decode() if "RRULE" in master else "",
+        "exception_count": sum("RECURRENCE-ID" in e for e in events),
+        "source_files": json.dumps(sorted((sources or {}).get(uid, [])), ensure_ascii=False),
+    }
+
+
+def csv_safe(row):
+    # Текст ICS не должен становиться формулой при открытии CSV в Excel.
+    return {key: ("'" + value if isinstance(value, str) and
+                  value.lstrip().startswith(("=", "+", "-", "@")) else value)
+            for key, value in row.items()}
+
+
+def import_events(client, calendar_url, events, report, sources=None):
     known = client.existing_uids(calendar_url)
     counts = defaultdict(int)
     with report.open("x", encoding="utf-8-sig", newline="") as stream:
-        writer = csv.writer(stream, delimiter=";")
-        writer.writerow(["uid_sha256", "status", "error"])
+        writer = csv.DictWriter(stream, fieldnames=REPORT_FIELDS, delimiter=";")
+        writer.writeheader()
         for uid, payload in events.items():
             digest = hashlib.sha256(uid.encode()).hexdigest()
             status, error = "skipped", ""
@@ -432,7 +486,9 @@ def import_events(client, calendar_url, events, report):
                     status = "needs_check"
                     error = str(exc) if isinstance(exc, Failure) else type(exc).__name__
             counts[status] += 1
-            writer.writerow([digest, status, error])
+            row = report_details(uid, payload, sources)
+            row.update(uid_sha256=digest, status=status, error=error)
+            writer.writerow(csv_safe(row))
             stream.flush()
             if status == "needs_check":
                 # Останавливаем запись при неопределённом исходе или отказе API.
@@ -470,7 +526,8 @@ def main():
             return 0
         client = None
         while True:
-            events, files, components = prepare(args.folder)
+            sources = {}
+            events, files, components = prepare(args.folder, sources)
             print(f"files={files} VEVENT={components} unique_UID={len(events)}")
             if not args.apply:
                 print("Локальная проверка завершена. Запросы к API и запись не выполнялись.")
@@ -480,7 +537,7 @@ def main():
                 if safe_url(args.calendar_url) not in client.calendars():
                     raise Failure("calendar_not_found: используйте точный URL из --list-calendars")
             report = Path(f"import_report_{datetime.now(timezone.utc):%Y%m%d_%H%M%S_%f}.csv")
-            result = import_events(client, args.calendar_url, events, report)
+            result = import_events(client, args.calendar_url, events, report, sources)
             if result or not args.watch:
                 return result
             time.sleep(args.watch)

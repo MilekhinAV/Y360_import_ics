@@ -33,6 +33,43 @@ class Failure(Exception):
     """Сообщения не содержат HTTP-тела, секретов или содержимого событий."""
 
 
+class HttpFailure(Failure):
+    def __init__(self, method, status, detail=""):
+        super().__init__(f"{method}:http_{status}" + (":" + detail if detail else ""))
+        self.method = method
+        self.status = status
+
+
+CALDAV_ERROR_TAGS = {
+    C + name: name for name in (
+        "valid-calendar-data", "valid-calendar-object-resource", "supported-calendar-data",
+        "supported-calendar-component", "no-uid-conflict", "max-resource-size",
+        "min-date-time", "max-date-time", "max-instances", "max-attendees-per-instance",
+        "valid-filter", "supported-filter", "calendar-collection-location",
+    )
+}
+CALDAV_ERROR_TAGS.update({D + name: name for name in (
+    "need-privileges", "quota-not-exceeded", "number-of-matches-within-limits",
+)})
+
+
+def safe_caldav_error(response):
+    """Только известные XML-коды. Текст, href и неизвестные имена не выводятся."""
+    try:
+        body = response.read(16385)
+        if len(body) > 16384:
+            return "caldav_error_too_large"
+        if not body.strip():
+            return "caldav_error_empty"
+        root = xml(body)
+        if root.tag != D + "error":
+            return "caldav_error_unknown"
+        codes = sorted({CALDAV_ERROR_TAGS[node.tag] for node in root if node.tag in CALDAV_ERROR_TAGS})
+        return ",".join(codes) or "caldav_error_unknown"
+    except (Failure, OSError, ValueError):
+        return "caldav_error_unreadable"
+
+
 class RateLimited(Failure):
     def __init__(self, method, retry_after=None):
         super().__init__(f"{method}:http_429")
@@ -157,13 +194,15 @@ def transport_once(method, url, *, token=None, data=None, headers=None):
                         detail = ":" + code
                 except (ValueError, OSError):
                     pass
+            elif urlsplit(url).hostname == "caldav.yandex.ru" and error.code not in {429, 502, 503, 504}:
+                detail = ":" + safe_caldav_error(error)
         finally:
             error.close()
         if error.code == 429:
             raise RateLimited(method, retry_after) from None
         if error.code in {502, 503, 504}:
             raise TemporaryServerError(method, error.code, retry_after) from None
-        raise Failure(f"{method}:http_{error.code}{detail}") from None
+        raise HttpFailure(method, error.code, detail.lstrip(":")) from None
     except (URLError, OSError):
         raise Failure(f"{method}:network_error") from None
 
@@ -390,7 +429,8 @@ def read_created_event(client, calendar_url, resource, uid):
         _, body = client.call("GET", resource)
         return body
     except Failure as exc:
-        if str(exc) != "GET:http_404":
+        if not ((isinstance(exc, HttpFailure) and exc.method == "GET" and exc.status == 404)
+                or str(exc) == "GET:http_404"):
             raise
     # Сервер может использовать другой href или показывать запись с задержкой.
     # Повторяем только чтение, никогда PUT.
@@ -483,7 +523,9 @@ def import_events(client, calendar_url, events, report, sources=None):
                     known.add(uid)
                 except Exception as exc:
                     # При сетевом сбое PUT мог примениться. Повторно здесь не отправляем.
-                    status = "needs_check"
+                    rejected = (isinstance(exc, HttpFailure) and exc.method == "PUT"
+                                and exc.status in {400, 422})
+                    status = "rejected" if rejected else "needs_check"
                     error = str(exc) if isinstance(exc, Failure) else type(exc).__name__
             counts[status] += 1
             row = report_details(uid, payload, sources)
@@ -495,7 +537,7 @@ def import_events(client, calendar_url, events, report, sources=None):
                 break
     print(" ".join(f"{key}={value}" for key, value in counts.items()))
     print(f"report={report.resolve()}")
-    return 1 if counts["needs_check"] else 0
+    return 1 if counts["needs_check"] or counts["rejected"] else 0
 
 
 def main():

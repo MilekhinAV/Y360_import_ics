@@ -21,6 +21,118 @@ def calendar(*events):
 
 
 class Tests(unittest.TestCase):
+    def test_rejected_event_does_not_block_next(self):
+        client = Mock()
+        client.existing_uids.return_value = set()
+        client.call.side_effect = [app.HttpFailure("PUT", 400, "valid-calendar-data"),
+                                   (201, b""), (200, calendar(event("next")))]
+        with tempfile.TemporaryDirectory() as folder, patch("sys.stdout", new_callable=io.StringIO):
+            report = Path(folder) / "r.csv"
+            result = app.import_events(client, app.BASE, {"test": calendar(event()), "next": calendar(event("next"))}, report)
+            with report.open(encoding="utf-8-sig") as f:
+                rows = list(csv.DictReader(f, delimiter=";"))
+        self.assertEqual(result, 1)
+        self.assertEqual([r["status"] for r in rows], ["rejected", "created"])
+        self.assertEqual(rows[0]["error"], "PUT:http_400:valid-calendar-data")
+
+    def test_only_put_validation_errors_allow_continuation(self):
+        for method, status in [("PUT", 401), ("PUT", 403), ("PUT", 412), ("GET", 400)]:
+            with self.subTest(method=method, status=status), tempfile.TemporaryDirectory() as folder, patch("sys.stdout", new_callable=io.StringIO):
+                client = Mock()
+                client.existing_uids.return_value = set()
+                client.call.side_effect = app.HttpFailure(method, status)
+                self.assertEqual(app.import_events(client, app.BASE, {"test": calendar(event()), "next": calendar(event("next"))}, Path(folder) / "r.csv"), 1)
+                self.assertEqual(client.call.call_count, 1)
+
+    def test_caldav_error_diagnostics_do_not_leak_text(self):
+        body = b'<d:error xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><c:valid-calendar-data>secret</c:valid-calendar-data><d:responsedescription>secret</d:responsedescription><c:secret/></d:error>'
+        self.assertEqual(app.safe_caldav_error(io.BytesIO(body)), "valid-calendar-data")
+        for body in [b'<html>secret</html>', b'{"error":"secret"}', b'<!DOCTYPE x><x/>', b'<x:secret xmlns:x="secret"/>']:
+            self.assertNotIn("secret", app.safe_caldav_error(io.BytesIO(body)))
+
+    def test_transport_extracts_caldav_error_and_closes_response(self):
+        body = b'<d:error xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><c:valid-calendar-object-resource/></d:error>'
+        error = HTTPError(app.BASE, 400, "secret", {}, io.BytesIO(body))
+        opener = Mock()
+        opener.open.side_effect = error
+        with patch.object(app, "build_opener", return_value=opener), patch.object(app.PACER, "wait"):
+            with self.assertRaises(app.HttpFailure) as caught:
+                app.transport_once("PUT", app.BASE)
+        self.assertEqual(str(caught.exception), "PUT:http_400:valid-calendar-object-resource")
+        self.assertTrue(error.closed)
+
+    def test_404_with_diagnostic_still_finds_uid(self):
+        client = Mock()
+        client.call.side_effect = app.HttpFailure("GET", 404, "caldav_error_empty")
+        client.find_event.return_value = calendar(event())
+        self.assertEqual(app.read_created_event(client, app.BASE, app.BASE + "x", "test"), calendar(event()))
+
+    def test_report_details_series(self):
+        body = calendar(event(extra="RRULE:FREQ=WEEKLY;COUNT=3\r\n"),
+                        event(extra="RECURRENCE-ID:20261020T090000Z\r\n"))
+        row = app.report_details("test", body, {"test": {"b.ics", "a.ics"}})
+        self.assertEqual(row["summary"], "Проверка")
+        self.assertEqual(row["start"], "2026-10-13T09:00:00+00:00")
+        self.assertEqual(row["exception_count"], 1)
+        self.assertEqual(row["source_files"], '["a.ics", "b.ics"]')
+
+    def test_report_all_day_duration_and_formula(self):
+        body = calendar(event(extra="DURATION:P1D\r\n")).replace(b"DTSTART:20261013T090000Z", b"DTSTART;VALUE=DATE:20261013")
+        row = app.report_details("test", body)
+        self.assertTrue(row["all_day"])
+        self.assertEqual(row["start"], "2026-10-13")
+        self.assertEqual(row["end"], "")
+        self.assertEqual(row["duration"], "P1D")
+        self.assertEqual(app.csv_safe({"summary": "=1+1"})["summary"], "'=1+1")
+
+    def test_prepare_records_sources(self):
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, "source.ics").write_bytes(calendar(event()))
+            sources = {}
+            app.prepare(Path(folder), sources)
+            self.assertEqual(sources, {"test": {"source.ics"}})
+
+    def test_temporary_errors_retry_only_reads(self):
+        for method in ("GET", "REPORT", "PROPFIND"):
+            for status in (502, 503, 504):
+                with self.subTest(method=method, status=status), patch.object(app, "transport_once", side_effect=[app.TemporaryServerError(method, status), (200, b"ok")]) as send, patch.object(app.time, "sleep") as sleep, patch("sys.stdout", new_callable=io.StringIO):
+                    self.assertEqual(app.transport(method, app.BASE), (200, b"ok"))
+                    self.assertEqual(send.call_count, 2)
+                    sleep.assert_called_once_with(5)
+
+    def test_temporary_errors_do_not_retry_writes(self):
+        for method in ("PUT", "POST", "DELETE"):
+            with self.subTest(method=method), patch.object(app, "transport_once", side_effect=app.TemporaryServerError(method, 504)) as send, patch.object(app.time, "sleep") as sleep:
+                with self.assertRaises(app.TemporaryServerError):
+                    app.transport(method, app.BASE)
+                self.assertEqual(send.call_count, 1)
+                sleep.assert_not_called()
+
+    def test_read_retry_budget_shared_with_429(self):
+        errors = [app.TemporaryServerError("GET", 502), app.RateLimited("GET", 40),
+                  app.TemporaryServerError("GET", 503), app.TemporaryServerError("GET", 504)]
+        with patch.object(app, "transport_once", side_effect=errors) as send, patch.object(app.time, "sleep") as sleep, patch("sys.stdout", new_callable=io.StringIO):
+            with self.assertRaisesRegex(app.Failure, "GET:http_504"):
+                app.transport("GET", app.BASE)
+        self.assertEqual(send.call_count, 4)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [5, 40, 20])
+
+    def test_http_503_preserves_retry_after(self):
+        opener = Mock()
+        opener.open.side_effect = HTTPError(app.BASE, 503, "private", {"Retry-After": "90"}, io.BytesIO())
+        with patch.object(app, "build_opener", return_value=opener), patch.object(app.PACER, "wait"), patch.object(app.time, "sleep") as sleep, patch("sys.stdout", new_callable=io.StringIO):
+            with self.assertRaisesRegex(app.Failure, "GET:http_503"):
+                app.transport("GET", app.BASE)
+        self.assertEqual([c.args[0] for c in sleep.call_args_list], [90, 90, 90])
+
+    def test_get_504_after_put_never_repeats_put(self):
+        client = app.CalDAV({})
+        client.token, client.expires = "test", float("inf")
+        body = calendar(event())
+        with patch.object(app, "transport_once", side_effect=[(201, b""), app.TemporaryServerError("GET", 504), (200, body)]) as send, patch.object(app.time, "sleep"), patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(app.create_and_read(client, app.BASE, app.BASE + "x.ics", "test", body), body)
+        self.assertEqual([c.args[0] for c in send.call_args_list], ["PUT", "GET", "GET"])
+
     def test_pacer_waits_between_requests(self):
         pacer = app.RequestPacer(2)
         with patch.object(app.time, "monotonic", side_effect=[10, 10, 10.5, 12]), patch.object(app.time, "sleep") as sleep:
